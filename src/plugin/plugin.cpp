@@ -33,6 +33,7 @@
 #include <QtQml>
 #include <QQmlEngine>
 #include <QQmlExtensionPlugin>
+#include <QTranslator>
 
 #include <qusbmoded.h>
 
@@ -51,6 +52,24 @@
 #include "locationsettings.h"
 #include "deviceinfo.h"
 #include "nfcsettings.h"
+#include "userinfo.h"
+#include "usermodel.h"
+
+class AppTranslator: public QTranslator
+{
+    Q_OBJECT
+public:
+    AppTranslator(QObject *parent)
+        : QTranslator(parent)
+    {
+        qApp->installTranslator(this);
+    }
+
+    virtual ~AppTranslator()
+    {
+        qApp->removeTranslator(this);
+    }
+};
 
 template<class T>
 static QObject *api_factory(QQmlEngine *, QJSEngine *)
@@ -66,8 +85,11 @@ class SystemSettingsPlugin : public QQmlExtensionPlugin
 public:
     void initializeEngine(QQmlEngine *engine, const char *uri)
     {
-        Q_UNUSED(engine)
-        Q_UNUSED(uri)
+        Q_ASSERT(QLatin1String(uri) == QLatin1String("org.nemomobile.systemsettings"));
+        AppTranslator *engineeringEnglish = new AppTranslator(engine);
+        engineeringEnglish->load("qml_plugin_systemsettings_eng_en", "/usr/share/translations");
+        AppTranslator *translator = new AppTranslator(engine);
+        translator->load(QLocale(), "qml_plugin_systemsettings", "-", "/usr/share/translations");
     }
 
     void registerTypes(const char *uri)
@@ -91,6 +113,8 @@ public:
         qmlRegisterType<LocationSettings>(uri, 1, 0, "LocationSettings");
         qmlRegisterType<DeviceInfo>(uri, 1, 0, "DeviceInfo");
         qmlRegisterType<NfcSettings>(uri, 1, 0, "NfcSettings");
+        qmlRegisterType<UserInfo>(uri, 1, 0, "UserInfo");
+        qmlRegisterType<UserModel>(uri, 1, 0, "UserModel");
     }
 };
 

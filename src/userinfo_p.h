@@ -1,7 +1,5 @@
 /*
- * Copyright (C) 2019 Jolla Ltd.
  * Copyright (C) 2020 Open Mobile Platform LLC.
- * Contact: Pekka Vuorela <pekka.vuorela@jolla.com>
  *
  * You may use this file under the terms of the BSD license as follows:
  *
@@ -31,12 +29,55 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE."
  */
 
-#ifndef LOCALECONFIG_H
-#define LOCALECONFIG_H
+#ifndef USERINFOPRIVATE_H
+#define USERINFOPRIVATE_H
 
+#include <sys/types.h>
+
+#include <QObject>
 #include <QString>
+#include <QWeakPointer>
 
-QString localeConfigPath();
-QString systemLocaleConfigPath();
+class QFileSystemWatcher;
 
-#endif
+class UserInfoPrivate : public QObject
+{
+    Q_OBJECT
+
+public:
+    UserInfoPrivate();
+    UserInfoPrivate(struct passwd *pwd);
+    ~UserInfoPrivate();
+
+    enum Tristated {
+        Yes = 1,
+        No = 0,
+        Unknown = -1
+    };
+
+    uid_t m_uid;
+    QString m_username;
+    QString m_name;
+    bool m_loggedIn;
+    static QWeakPointer<UserInfoPrivate> s_current;
+    QFileSystemWatcher *m_watcher;
+    Tristated m_alone;
+
+    void set(struct passwd *pwd);
+    bool alone();
+    void updateAlone(bool force = false);
+
+public slots:
+    void databaseChanged(const QString &path);
+
+signals:
+    void displayNameChanged();
+    void usernameChanged();
+    void nameChanged();
+    void uidChanged();
+    void currentChanged();
+    void watchedChanged();
+    void aloneChanged();
+};
+
+#endif /* USERINFOPRIVATE_H */

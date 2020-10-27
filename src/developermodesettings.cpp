@@ -1,6 +1,6 @@
 /*
  * Copyright (c) 2013 – 2019 Jolla Ltd.
- * Copyright (c) 2019 Open Mobile Platform LLC.
+ * Copyright (c) 2019 – 2020 Open Mobile Platform LLC.
  * Contact: Thomas Perl <thomas.perl@jollamobile.com>
  * Contact: Raine Makelainen <raine.makelainen@jolla.com>
  *
@@ -41,9 +41,6 @@
 #include <QNetworkInterface>
 #include <transaction.h>
 
-#include <getdef.h>
-#include <pwd.h>
-
 /* Symbolic constants */
 #define PROGRESS_INDETERMINATE (-1)
 
@@ -71,6 +68,9 @@
 #define USB_MODED_CONFIG_IP "ip"
 #define USB_MODED_CONFIG_INTERFACE "interface"
 
+/* Package which will move debug folder to /home/.system/usr/lib */
+#define DEBUG_HOME_PACKAGE "jolla-developer-mode-home-debug-location"
+
 static QMap<QString,QString> enumerate_network_interfaces()
 {
     QMap<QString,QString> result;
@@ -97,13 +97,24 @@ static QString get_cached_package(const QString &version)
     return dir.absoluteFilePath(preloaded.last());
 }
 
+namespace {
+    bool debugHomeFolderExists()
+    {
+        QDir pathDir("/home/.system/usr/lib/debug");
+        if (pathDir.exists()) {
+            return true;
+        }
+        return false;
+    }
+}
+
 DeveloperModeSettings::DeveloperModeSettings(QObject *parent)
     : QObject(parent)
     , m_usbModeDaemon(USB_MODED_SERVICE, USB_MODED_PATH, USB_MODED_INTERFACE, QDBusConnection::systemBus())
     , m_wlanIpAddress("-")
     , m_usbInterface(USB_NETWORK_FALLBACK_INTERFACE)
     , m_usbIpAddress(USB_NETWORK_FALLBACK_IP)
-    , m_username("nemo")
+    , m_username(qgetenv("USER"))
     , m_developerModeEnabled(QFile::exists(DEVELOPER_MODE_PROVIDED_FILE))
     , m_workStatus(Idle)
     , m_workProgress(PROGRESS_INDETERMINATE)
@@ -112,15 +123,9 @@ DeveloperModeSettings::DeveloperModeSettings(QObject *parent)
     , m_refreshedForInstall(false)
     , m_localInstallFailed(false)
     , m_localDeveloperModePackagePath(get_cached_package(QStringLiteral("*")))  // Initialized to possibly incompatible package
+    , m_debugHomeEnabled(debugHomeFolderExists())
+    , m_installationType(None)
 {
-    int uid = getdef_num("UID_MIN", -1);
-    struct passwd *pwd;
-    if ((pwd = getpwuid(uid)) != NULL) {
-        m_username = QString(pwd->pw_name);
-    } else {
-        qCWarning(lcDeveloperModeLog) << "Failed to return username using getpwuid()";
-    }
-
     // Resolve and update local package path
     if (!m_localDeveloperModePackagePath.isEmpty()) {
         PackageKit::Transaction *resolvePackage = PackageKit::Daemon::resolve(DEVELOPER_MODE_PACKAGE"-preload", PackageKit::Transaction::FilterInstalled);
@@ -184,6 +189,35 @@ bool DeveloperModeSettings::repositoryAccessRequired() const
     return m_localInstallFailed || m_localDeveloperModePackagePath.isEmpty();
 }
 
+bool DeveloperModeSettings::debugHomeEnabled() const
+{
+    return m_debugHomeEnabled;
+}
+
+enum DeveloperModeSettings::InstallationType DeveloperModeSettings::installationType() const
+{
+    return m_installationType;
+}
+
+QString DeveloperModeSettings::packageName()
+{
+    if (m_installationType == DeveloperMode) {
+        return DEVELOPER_MODE_PACKAGE;
+    } else if (m_installationType == DebugHome) {
+        return DEBUG_HOME_PACKAGE;
+    } else {
+        return QString();
+    }
+}
+
+void DeveloperModeSettings::setInstallationType(InstallationType type)
+{
+    if (m_installationType != type) {
+        m_installationType = type;
+        emit installationTypeChanged();
+    }
+}
+
 void DeveloperModeSettings::setDeveloperMode(bool enabled)
 {
     if (m_developerModeEnabled != enabled) {
@@ -193,6 +227,25 @@ void DeveloperModeSettings::setDeveloperMode(bool enabled)
         }
 
         m_refreshedForInstall = false;
+        setInstallationType(DeveloperMode);
+        if (enabled) {
+            resolveAndExecute(InstallCommand);
+        } else {
+            resolveAndExecute(RemoveCommand);
+        }
+    }
+}
+
+void DeveloperModeSettings::moveDebugToHome(bool enabled)
+{
+    if (m_debugHomeEnabled != enabled) {
+        if (m_workStatus != Idle) {
+            qCWarning(lcDeveloperModeLog) << "Debug home state change requested during activity, ignored.";
+            return;
+        }
+
+        m_refreshedForInstall = false;
+        setInstallationType(DebugHome);
         if (enabled) {
             resolveAndExecute(InstallCommand);
         } else {
@@ -272,9 +325,9 @@ void DeveloperModeSettings::resolveAndExecute(Command command)
 {
     setWorkStatus(Preparing);
     m_workProgress = 0;
-    m_developerModePackageId.clear(); // might differ between installed/available
+    m_packageId.clear(); // might differ between installed/available
 
-    if (command == InstallCommand && !m_localInstallFailed && !m_localDeveloperModePackagePath.isEmpty()) {
+    if (command == InstallCommand && !m_localInstallFailed && !m_localDeveloperModePackagePath.isEmpty() && m_installationType == DeveloperMode) {
         // Resolve which version of developer mode package is expected
         PackageKit::Transaction *resolvePackage = PackageKit::Daemon::resolve(DEVELOPER_MODE_PACKAGE"-preload", PackageKit::Transaction::FilterInstalled);
         connect(resolvePackage, &PackageKit::Transaction::errorCode, this, &DeveloperModeSettings::reportTransactionErrorCode);
@@ -314,71 +367,86 @@ void DeveloperModeSettings::resolveAndExecute(Command command)
         });
 
     } else {
-        PackageKit::Transaction::Filters filters;
-        if (command == RemoveCommand) {
-            filters = PackageKit::Transaction::FilterInstalled;
-        } else {
-            filters = PackageKit::Transaction::FilterNewest;
-        }
-        PackageKit::Transaction *resolvePackage = PackageKit::Daemon::resolve(DEVELOPER_MODE_PACKAGE, filters);
+        // Install package form repos
+        installAndRemove(command);
+    }
+}
 
-        connect(resolvePackage, &PackageKit::Transaction::errorCode, this, &DeveloperModeSettings::reportTransactionErrorCode);
-        connect(resolvePackage, &PackageKit::Transaction::package,
-                this, [this](PackageKit::Transaction::Info info, const QString &packageId, const QString &summary) {
-            qCDebug(lcDeveloperModeLog) << "Package transaction:" << info << packageId << "summary:" << summary;
-            m_developerModePackageId = packageId;
-        });
+bool DeveloperModeSettings::installAndRemove(Command command) 
+{
+    if (packageName().isEmpty()) {
+        qCWarning(lcDeveloperModeLog) << "No installation package name set. Shouldn't happen.";
+        resetState();
+        return false;
+    }
 
-        connect(resolvePackage, &PackageKit::Transaction::finished,
-                this, [this, command](PackageKit::Transaction::Exit status, uint runtime) {
-            Q_UNUSED(runtime)
+    PackageKit::Transaction::Filters filters;
+    if (command == RemoveCommand) {
+        filters = PackageKit::Transaction::FilterInstalled;
+    } else {
+        filters = PackageKit::Transaction::FilterNewest;
+    }
 
-            if (status != PackageKit::Transaction::ExitSuccess || m_developerModePackageId.isEmpty()) {
-                if (command == InstallCommand) {
-                    if (m_refreshedForInstall) {
-                        qCWarning(lcDeveloperModeLog) << "Failed to install developer mode, package didn't resolve.";
-                        resetState();
-                    } else {
-                        refreshPackageCacheAndInstall(); // try once if it helps
-                    }
-                } else if (command == RemoveCommand) {
-                    qCWarning(lcDeveloperModeLog) << "Removing developer mode but package didn't resolve into anything. Shouldn't happen.";
-                    resetState();
-                }
+    PackageKit::Transaction *resolvePackage = PackageKit::Daemon::resolve(packageName(), filters);
 
-            } else if (command == InstallCommand) {
-                PackageKit::Transaction *tx = PackageKit::Daemon::installPackage(m_developerModePackageId);
-                connectCommandSignals(tx);
+    connect(resolvePackage, &PackageKit::Transaction::errorCode, this, &DeveloperModeSettings::reportTransactionErrorCode);
+    connect(resolvePackage, &PackageKit::Transaction::package,
+            this, [this](PackageKit::Transaction::Info info, const QString &packageId, const QString &summary) {
+        qCDebug(lcDeveloperModeLog) << "Package transaction:" << info << packageId << "summary:" << summary;
+        m_packageId = packageId;
+    });
 
+    connect(resolvePackage, &PackageKit::Transaction::finished,
+            this, [this, command](PackageKit::Transaction::Exit status, uint runtime) {
+        Q_UNUSED(runtime)
+
+        if (status != PackageKit::Transaction::ExitSuccess || m_packageId.isEmpty()) {
+            if (command == InstallCommand) {
                 if (m_refreshedForInstall) {
-                    connect(tx, &PackageKit::Transaction::finished,
-                            this, [this](PackageKit::Transaction::Exit status, uint runtime) {
-                        qCDebug(lcDeveloperModeLog) << "Developer mode installation transaction done (with refresh):" << status << runtime;
-                        resetState();
-                    });
+                    qCWarning(lcDeveloperModeLog) << "Failed to install, package didn't resolve.";
+                    resetState();
                 } else {
-                    connect(tx, &PackageKit::Transaction::finished,
-                            this, [this](PackageKit::Transaction::Exit status, uint runtime) {
-                        if (status == PackageKit::Transaction::ExitSuccess) {
-                            qCDebug(lcDeveloperModeLog) << "Developer mode installation transaction done:" << status << runtime;
-                            resetState();
-                        } else {
-                            qCDebug(lcDeveloperModeLog) << "Developer mode installation failed, trying again after refresh";
-                            refreshPackageCacheAndInstall();
-                        }
-                    });
+                    refreshPackageCacheAndInstall(); // try once if it helps
                 }
-            } else {
-                PackageKit::Transaction *tx = PackageKit::Daemon::removePackage(m_developerModePackageId, true, true);
-                connectCommandSignals(tx);
+            } else if (command == RemoveCommand) {
+                qCWarning(lcDeveloperModeLog) << "Removing package but package didn't resolve into anything. Shouldn't happen.";
+                resetState();
+            }
+
+        } else if (command == InstallCommand) {
+            PackageKit::Transaction *tx = PackageKit::Daemon::installPackage(m_packageId);
+            connectCommandSignals(tx);
+
+            if (m_refreshedForInstall) {
                 connect(tx, &PackageKit::Transaction::finished,
                         this, [this](PackageKit::Transaction::Exit status, uint runtime) {
-                    qCDebug(lcDeveloperModeLog) << "Developer mode removal transaction done:" << status << runtime;
+                    qCDebug(lcDeveloperModeLog) << "Installation transaction done (with refresh):" << status << runtime;
                     resetState();
                 });
+            } else {
+                connect(tx, &PackageKit::Transaction::finished,
+                        this, [this](PackageKit::Transaction::Exit status, uint runtime) {
+                    if (status == PackageKit::Transaction::ExitSuccess) {
+                        qCDebug(lcDeveloperModeLog) << "Installation transaction done:" << status << runtime;
+                        resetState();
+                    } else {
+                        qCDebug(lcDeveloperModeLog) << "Installation failed, trying again after refresh";
+                        refreshPackageCacheAndInstall();
+                    }
+                });
             }
-        });
-    }
+
+        } else {
+            PackageKit::Transaction *tx = PackageKit::Daemon::removePackage(m_packageId, true, true);
+            connectCommandSignals(tx);
+            connect(tx, &PackageKit::Transaction::finished,
+                    this, [this](PackageKit::Transaction::Exit status, uint runtime) {
+                qCDebug(lcDeveloperModeLog) << "Package removal transaction done:" << status << runtime;
+                resetState();
+            });
+        }
+    });
+    return true;
 }
 
 void DeveloperModeSettings::connectCommandSignals(PackageKit::Transaction *transaction)
@@ -489,13 +557,21 @@ void DeveloperModeSettings::updateState(int percentage, PackageKit::Transaction:
 
 void DeveloperModeSettings::resetState()
 {
-    bool enabled = QFile::exists(DEVELOPER_MODE_PROVIDED_FILE);
-    if (m_developerModeEnabled != enabled) {
-        m_developerModeEnabled = enabled;
-        emit developerModeEnabledChanged();
+    if (m_installationType == DeveloperMode) {
+        bool enabled = QFile::exists(DEVELOPER_MODE_PROVIDED_FILE);
+        if (m_developerModeEnabled != enabled) {
+            m_developerModeEnabled = enabled;
+            emit developerModeEnabledChanged();
+        }
+    } else if (m_installationType == DebugHome) {
+        if (m_debugHomeEnabled != debugHomeFolderExists()) {
+            m_debugHomeEnabled = debugHomeFolderExists();
+            emit debugHomeEnabledChanged();
+        }
     }
 
     setWorkStatus(Idle);
+    setInstallationType(None);
 
     if (m_workProgress != PROGRESS_INDETERMINATE) {
         m_workProgress = PROGRESS_INDETERMINATE;
